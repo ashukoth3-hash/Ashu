@@ -1,710 +1,342 @@
-# -*- coding: utf-8 -*-
-# Refer–Earn Telegram Bot (python-telegram-bot v21)
-# Author: you ✨
-
-import os, json, asyncio, time
+import os, json, asyncio
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any
 
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, ChatMember
+    Update, InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ConversationHandler, ContextTypes, filters
+    ContextTypes
 )
 from telegram.error import Forbidden
 
-# ===================== CONFIG =====================
-
-# Token: ENV se le (Render par "BOT_TOKEN" env var lagana)
-BOT_TOKEN = os.getenv("7573978624:AAG9Ki0ZVglaAHH_c-fUOF7KoTOOuYIDKrU", "7573978624:AAG9Ki0ZVglaAHH_c-fUOF7KoTOOuYIDKrU").strip()
+# =============== CONFIG ===============
+BOT_TOKEN = os.getenv("7573978624:AAGcZDx_q346W3ShSUirnX2voQaaGO7fjcE") or "7573978624:AAGcZDx_q346W3ShSUirnX2voQaaGO7fjcE" # Render ENV var
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
-# Admins (comma se add kar sakte ho)
-ADMINS = {1898098929}
-
-# Join-force channels (usernames WITHOUT @)
+# Force-join channels (WITHOUT @)
 REQUIRED_CHANNELS = [
     "loot4udeal",
     "free_redeem_codes_fire_crypto",
     "crypto_free_redeem_codes_fire",
 ]
 
-# Proof channel (username WITHOUT @)
-PROOF_CHANNEL = "vipredeem"
+# Proof channel (OPEN LINK)
+PROOF_CHANNEL_URL = "https://t.me/vipredeem"
 
-# Coins config
+# Admins (numeric Telegram user IDs)
+ADMINS = {1898098929}
+
+# Coins settings
 SIGNUP_BONUS = 50
-DAILY_BONUS  = 10
-REFER_COIN   = 100
+DAILY_BONUS = 10
+REFER_BONUS = 100
 
-# Withdraw slabs: (required_coins, label/text)
-WITHDRAW_OPTIONS: List[Tuple[int, str]] = [
-    (2000,  "₹10"),
-    (4000,  "₹20"),
-    (8000,  "₹45"),  # 40 + 5 extra
+# Withdraw slabs: [coins, label]
+WITHDRAW_OPTIONS = [
+    (2000, "2000 coins – ₹10"),
+    (4000, "4000 coins – ₹20"),
+    (8000, "8000 coins – ₹45"),
 ]
 
-# ===================== DB =====================
-
 DB_FILE = "db.json"
+db: Dict[str, Any] = {"users": {}}
 DB_LOCK = asyncio.Lock()
-db: Dict[str, Any] = {"users": {}, "withdraws": []}  # simple JSON store
 
 
-def _now_ts() -> int:
-    return int(time.time())
-
-
-def _human_td(seconds: int) -> str:
-    # 90061 -> "1d 1h 1m"
-    d, r = divmod(seconds, 86400)
-    h, r = divmod(r, 3600)
-    m, _ = divmod(r, 60)
-    parts = []
-    if d: parts.append(f"{d}d")
-    if h: parts.append(f"{h}h")
-    if m: parts.append(f"{m}m")
-    return " ".join(parts) or "0m"
-
-
-def load_db() -> None:
+# =============== DB HELPERS ===============
+def load_db():
     global db
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                db = json.load(f)
-        except Exception:
-            db = {"users": {}, "withdraws": []}
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            db = json.load(f)
+    except Exception:
+        db = {"users": {}}
 
-
-def save_db() -> None:
-    tmp = DB_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DB_FILE)
-
+def save_db():
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 def get_user(uid: int) -> Dict[str, Any]:
-    suid = str(uid)
-    if suid not in db["users"]:
-        db["users"][suid] = {
+    uid = str(uid)
+    if uid not in db["users"]:
+        db["users"][uid] = {
             "coins": 0,
-            "verified": False,
             "ref_by": None,
-            "ref_credited": False,
-            "refs": [],
-            "last_bonus_at": 0,   # unix ts
+            "verified": False,
+            "joined_bonus_done": False,
+            "last_bonus_date": None,
+            "refs": 0,
             "email": None,
         }
-    return db["users"][suid]
+    return db["users"][uid]
 
 
-# ===================== UI HELPERS =====================
-
-def name_of(u: Update) -> str:
-    user = u.effective_user
-    first = (user.first_name or "").strip()
-    return first or "User"
-
-
-def join_force_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    # Join buttons
-    join_buttons = []
-    for idx, uname in enumerate(REQUIRED_CHANNELS, start=1):
-        url = f"https://t.me/{uname}"
-        join_buttons.append(InlineKeyboardButton(f"Join {idx}", url=url))
-        if len(join_buttons) == 2:
-            rows.append(join_buttons)
-            join_buttons = []
-    if join_buttons:
-        rows.append(join_buttons)
-    # Claim button
-    rows.append([InlineKeyboardButton("✅ Claim", callback_data="claim_join")])
+# =============== UI ===============
+def join_force_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Join 1", url=f"https://t.me/{REQUIRED_CHANNELS[0]}")],
+        [InlineKeyboardButton("Join 2", url=f"https://t.me/{REQUIRED_CHANNELS[1]}")],
+        [InlineKeyboardButton("Join 3", url=f"https://t.me/{REQUIRED_CHANNELS[2]}")],
+        [InlineKeyboardButton("✅ Claim", callback_data="claim_join")],
+    ]
     return InlineKeyboardMarkup(rows)
-
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Balance",  callback_data="balance"),
-         InlineKeyboardButton("👥 Refer",     callback_data="refer")],
+    rows = [
+        [InlineKeyboardButton("💰 Balance", callback_data="balance"),
+         InlineKeyboardButton("👥 Refer", callback_data="refer")],
         [InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily_bonus")],
         [InlineKeyboardButton("✉️ Withdraw", callback_data="withdraw")],
-        [InlineKeyboardButton("🧾 Proof",     callback_data="proof")]
-    ])
+        [InlineKeyboardButton("🧾 Proof", callback_data="proof")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
-
-def withdraw_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    btns = []
-    for need, label in WITHDRAW_OPTIONS:
-        btns.append(InlineKeyboardButton(f"{need} coins – {label}",
-                                         callback_data=f"wd_{need}"))
-        if len(btns) == 1:
-            rows.append(btns)
-            btns = []
-    if btns:
-        rows.append(btns)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="home")])
+def withdraw_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"wd_{coins}")]
+            for coins, label in WITHDRAW_OPTIONS]
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
 
 
-async def is_joined_everywhere(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
-    ok = True
-    for uname in REQUIRED_CHANNELS:
+# =============== FORCE JOIN CHECK ===============
+async def is_joined_everywhere(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    bot = ctx.bot
+    for ch in REQUIRED_CHANNELS:
         try:
-            cm: ChatMember = await context.bot.get_chat_member(f"@{uname}", uid)
-            status = cm.status
-            if status not in ("member", "administrator", "creator"):
-                ok = False
-                break
+            m = await bot.get_chat_member(f"@{ch}", user_id)
+            if m.status in ("left", "kicked"):
+                return False
         except Forbidden:
-            # bot not admin in channel or channel privacy — treat as not joined
-            ok = False
-            break
+            # if bot not admin / channel private etc., skip check to avoid hard block
+            return False
         except Exception:
-            ok = False
-            break
-    return ok
+            return False
+    return True
 
 
-async def ensure_verified(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    uid = update.effective_user.id
-    async with DB_LOCK:
-        u = get_user(uid)
-        verified = u["verified"]
-    if verified:
-        return True
-
-    # Not verified -> show join panel
-    await update.effective_message.reply_text(
-        f"😍 Hey !! <b>{name_of(update)}</b> Welcome To Bot\n"
-        "🟢 Must Join All Channels To Use Bot\n"
-        "⬛ After Joining click <b>Claim</b>",
-        reply_markup=join_force_keyboard(),
-        parse_mode="HTML",
-    )
-    return False
-
-
-# ===================== USER HANDLERS =====================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    args = context.args or []
-
-    async with DB_LOCK:
-        u = get_user(uid)
-        # attach referral on first start
-        if args:
-            ref = args[0]
-            if ref.isdigit():
-                rid = int(ref)
-                if rid != uid and u["ref_by"] is None:
-                    u["ref_by"] = rid
-        save_db()
-
-    # Start panel (join-force first)
-    await update.message.reply_text(
-        f"😍 Hey !! <b>{name_of(update)}</b> Welcome To Bot\n"
-        "🟢 Must Join All Channels To Use Bot\n"
-        "⬛ After Joining click <b>Claim</b>",
-        reply_markup=join_force_keyboard(),
-        parse_mode="HTML",
-    )
-
-    # Also show main menu for those already verified
-    async with DB_LOCK:
-        already = get_user(uid)["verified"]
-    if already:
-        await update.message.reply_text("✅ Bot live! Try /ping",
-                                        reply_markup=main_menu_kb())
-
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong")
-
-
-async def on_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_verified(update, context):
-        return
-    await update.effective_message.reply_text("✅ Bot live! Try /ping",
-                                              reply_markup=main_menu_kb())
-
-
-async def on_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-
-    joined = await is_joined_everywhere(context, uid)
-    async with DB_LOCK:
-        u = get_user(uid)
-        if joined:
-            if not u["verified"]:
-                u["verified"] = True
-                u["coins"] += SIGNUP_BONUS
-
-                # credit referrer once
-                if u["ref_by"] and not u["ref_credited"]:
-                    ref_id = u["ref_by"]
-                    ref_u = get_user(ref_id)
-                    ref_u["coins"] += REFER_COIN
-                    ref_u["refs"].append(uid)
-                    u["ref_credited"] = True
-                    save_db()
-                    try:
-                        await context.bot.send_message(
-                            ref_id,
-                            f"✅ <b>1 Refer Successful!</b>\n"
-                            f"+{REFER_COIN} coins added.",
-                            parse_mode="HTML"
-                        )
-                    except Exception:
-                        pass
-            save_db()
-
-    if not joined:
-        await q.edit_message_text(
-            "⚠️ Abhi tak aapne sabhi channels join nahi kiye.\n"
-            "Please join and then tap <b>Claim</b>.",
-            reply_markup=join_force_keyboard(), parse_mode="HTML"
-        )
-        return
-
-    # Success -> show menu
-    await q.edit_message_text(
-        f"🎉 Verification complete! {SIGNUP_BONUS} coins added.\n"
-        "Ab niche se options use karein.",
-        reply_markup=main_menu_kb()
-    )
-
-
-async def on_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await ensure_verified(update, context):
-        return
-
-    uid = q.from_user.id
-    async with DB_LOCK:
-        coins = get_user(uid)["coins"]
-
-    msg = (
-        f"Hello 👋 <b>{q.from_user.first_name}</b>\n\n"
-        f"APKA ABHI BALANCE H 🤑 <b>{coins} coins</b>\n"
-        f"MINIMUM WITHDRAWAL <b>{WITHDRAW_OPTIONS[0][0]} coins</b> ka h."
-    )
-    await q.edit_message_text(msg, reply_markup=main_menu_kb(), parse_mode="HTML")
-
-
-async def on_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await ensure_verified(update, context):
-        return
-
-    bot = await context.bot.get_me()
-    link = f"https://t.me/{bot.username}?start={q.from_user.id}"
-
-    msg = (
-        f"Hello 👋 <b>{q.from_user.first_name}</b>\n"
-        f"Apka Referral Link 👇\n{link}\n\n"
-        f"Per Refer = <b>{REFER_COIN} coins</b> 🪙\n"
-        "🔴 Not Fake Refer Allowed."
-    )
-    await q.edit_message_text(msg, reply_markup=main_menu_kb(), parse_mode="HTML")
-
-
-async def on_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await ensure_verified(update, context):
-        return
-
-    uid = q.from_user.id
-    now = _now_ts()
-    async with DB_LOCK:
-        u = get_user(uid)
-        last = u["last_bonus_at"]
-        if now - last >= 24 * 3600:
-            u["coins"] += DAILY_BONUS
-            u["last_bonus_at"] = now
-            save_db()
-            got = True
-        else:
-            got = False
-            left = 24 * 3600 - (now - last)
-
-    if got:
-        text = (
-            f"Hello 👋 <b>{q.from_user.first_name}</b>\n"
-            f"Daily bonus har 24 hours me add hota hai.\n"
-            f"Aaj ka bonus: +{DAILY_BONUS} coins ✅"
-        )
-    else:
-        text = (
-            f"Hello 👋 <b>{q.from_user.first_name}</b>\n"
-            "Daily bonus har 24 hours me add hota hai.\n"
-            f"Next bonus in: <b>{_human_td(left)}</b>"
-        )
-
-    await q.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode="HTML")
-
-
-# ---------- Withdraw flow ----------
-ASK_EMAIL, = range(1)
-
-async def on_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await ensure_verified(update, context):
-        return
-
-    uid = q.from_user.id
-    async with DB_LOCK:
-        coins = get_user(uid)["coins"]
-
-    msg = (
-        f"Hello 👋 <b>{q.from_user.first_name}</b>\n"
-        f"Aapka balance: <b>{coins} coins</b>\n\n"
-        "Withdrawal 1–2 hours me aapke <b>email</b> par aa jayega.\n"
-        "Amount choose karein:"
-    )
-    await q.edit_message_text(msg, reply_markup=withdraw_keyboard(), parse_mode="HTML")
-
-
-async def wd_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not await ensure_verified(update, context):
-        return
-
-    uid = q.from_user.id
-    data = q.data  # wd_<coins> or home
-
-    if data == "home":
-        await q.edit_message_text("Menu:", reply_markup=main_menu_kb())
-        return
-
-    need = int(data.split("_")[1])
-
-    async with DB_LOCK:
-        u = get_user(uid)
-        coins = u["coins"]
-
-    if coins < need:
-        await q.edit_message_text(
-            f"⚠️ Aapke paas itne coins nahi hain. Required: {need}.",
-            reply_markup=withdraw_keyboard()
-        )
-        return
-
-    # store choice
-    context.user_data["wd_need"] = need
-    await q.edit_message_text(
-        "📝 Email bhejein jisme aap code lena chahte ho.\n\n"
-        "Example: <code>name@example.com</code>",
-        parse_mode="HTML"
-    )
-    return ASK_EMAIL
-
-
-async def wd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    email = (update.message.text or "").strip()
-
-    # very light check
-    if "@" not in email or "." not in email:
-        await update.message.reply_text("❌ Email galat lag rha hai, dubara bhejein.")
-        return ASK_EMAIL
-
-    need = context.user_data.get("wd_need")
-
-    # Deduct + create pending request
-    async with DB_LOCK:
-        u = get_user(uid)
-        if u["coins"] < need:
-            await update.message.reply_text("⚠️ Coins kam ho gaye, dubara try karo.")
-            return ConversationHandler.END
-
-        u["coins"] -= need
-        wd_id = f"wd_{int(time.time())}_{uid}"
-        db["withdraws"].append({
-            "id": wd_id,
-            "uid": uid,
-            "amount": need,
-            "label": next((lbl for c,lbl in WITHDRAW_OPTIONS if c == need), ""),
-            "email": email,
-            "ts": _now_ts(),
-            "status": "pending",
-        })
-        save_db()
-
-    await update.message.reply_text(
-        "✅ Withdrawal request received!\n"
-        "1–2 ghante me aapke email par code aa jayega.\n"
-        "Admin approval pending…",
-        reply_markup=main_menu_kb()
-    )
-
-    # Notify admins with approve/reject buttons
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Approve", callback_data=f"appr_{wd_id}"),
-         InlineKeyboardButton("❌ Reject",  callback_data=f"rej_{wd_id}")]
-    ])
-    text = (f"🟡 New WD Request\n"
-            f"ID: {wd_id}\nUser: <code>{uid}</code>\n"
-            f"Amount: {need} coins\nEmail: {email}")
-    for admin in ADMINS:
-        try:
-            await context.bot.send_message(admin, text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            pass
-
-    return ConversationHandler.END
-
-
-# ---------- Proof ----------
-
-async def on_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(update, Update) and update.callback_query:
-        q = update.callback_query
-        await q.answer()
-        msgf = q.edit_message_text
-    else:
-        msgf = update.message.reply_text
-
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Open Proof Channel", url=f"https://t.me/{PROOF_CHANNEL}")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="home")]
-    ])
-    await msgf("Proofs yahan milenge:", reply_markup=btn)
-
-
-# ===================== ADMIN =====================
-
-ADMIN_ADD, ADMIN_DEDUCT, ADMIN_BCAST = range(3)
-
-def admin_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Coins", callback_data="ad_add"),
-         InlineKeyboardButton("➖ Deduct Coins", callback_data="ad_deduct")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="ad_cast")],
-        [InlineKeyboardButton("🟡 Pending WDs", callback_data="ad_wds")]
-    ])
-
-
-def admin_only(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id
-        if uid not in ADMINS:
-            return
-        return await func(update, context)
-    return wrapper
-
-
-@admin_only
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👮 Admin Panel", reply_markup=admin_kb())
-
-
-@admin_only
-async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    data = q.data
-    if data == "ad_add":
-        await q.edit_message_text("Send: <code>user_id coins</code>", parse_mode="HTML")
-        return ADMIN_ADD
-    if data == "ad_deduct":
-        await q.edit_message_text("Send: <code>user_id coins</code>", parse_mode="HTML")
-        return ADMIN_DEDUCT
-    if data == "ad_cast":
-        await q.edit_message_text("Send broadcast message (text/photo/caption).")
-        return ADMIN_BCAST
-    if data == "ad_wds":
-        async with DB_LOCK:
-            pend = [w for w in db["withdraws"] if w["status"] == "pending"]
-        if not pend:
-            await q.edit_message_text("No pending withdrawals.", reply_markup=admin_kb())
-            return ConversationHandler.END
-        text = "Pending WDs:\n" + "\n".join(
-            f"- {w['id']} • {w['amount']}c • uid {w['uid']} • {w['email']}" for w in pend[:10]
-        )
-        await q.edit_message_text(text, reply_markup=admin_kb())
-        return ConversationHandler.END
-
-    # Approve / Reject from notifications
-    if data.startswith("appr_") or data.startswith("rej_"):
-        wid = data.split("_", 1)[1]
-        status = "approved" if data.startswith("appr_") else "rejected"
-
-        async with DB_LOCK:
-            w = next((x for x in db["withdraws"] if x["id"] == wid), None)
-            if not w or w["status"] != "pending":
-                await q.edit_message_text("Not found / already processed.")
-                return ConversationHandler.END
-            w["status"] = status
-            save_db()
-
-        try:
-            await context.bot.send_message(
-                w["uid"],
-                f"🔔 Withdrawal {status.upper()}.\n"
-                f"Amount: {w['amount']} coins • Email: {w['email']}"
-            )
-        except Exception:
-            pass
-        await q.edit_message_text(f"OK: {wid} -> {status}")
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-
-@admin_only
-async def admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid_s, coins_s = update.message.text.strip().split()
-        uid, coins = int(uid_s), int(coins_s)
-    except Exception:
-        await update.message.reply_text("Format galat. Example: <code>12345 100</code>", parse_mode="HTML")
-        return ADMIN_ADD
-
-    async with DB_LOCK:
-        u = get_user(uid)
-        u["coins"] += coins
-        save_db()
-
-    await update.message.reply_text(f"Done: {uid} +{coins} coins.", reply_markup=admin_kb())
-    try:
-        await context.bot.send_message(uid, f"🔔 Admin ne +{coins} coins add kiye.")
-    except Exception:
-        pass
-    return ConversationHandler.END
-
-
-@admin_only
-async def admin_deduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid_s, coins_s = update.message.text.strip().split()
-        uid, coins = int(uid_s), int(coins_s)
-    except Exception:
-        await update.message.reply_text("Format galat. Example: <code>12345 50</code>", parse_mode="HTML")
-        return ADMIN_DEDUCT
-
-    async with DB_LOCK:
-        u = get_user(uid)
-        u["coins"] = max(0, u["coins"] - coins)
-        save_db()
-
-    await update.message.reply_text(f"Done: {uid} -{coins} coins.", reply_markup=admin_kb())
-    try:
-        await context.bot.send_message(uid, f"🔔 Admin ne -{coins} coins deduct kiye.")
-    except Exception:
-        pass
-    return ConversationHandler.END
-
-
-@admin_only
-async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # forward style broadcast (text/caption only)
-    # NOTE: heavy loops should be rate-limited
-    async with DB_LOCK:
-        uids = list(map(int, db["users"].keys()))
-
-    cnt = 0
-    for uid in uids:
-        try:
-            if update.message.photo:
-                file_id = update.message.photo[-1].file_id
-                cap = update.message.caption or ""
-                await context.bot.send_photo(uid, file_id, caption=cap)
-            else:
-                await context.bot.send_message(uid, update.message.text_html or update.message.text)
-            cnt += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            await asyncio.sleep(0.01)
-
-    await update.message.reply_text(f"Broadcast sent to {cnt} users.", reply_markup=admin_kb())
-    return ConversationHandler.END
-
-
-# ===================== ROUTER =====================
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-
-    if data == "claim_join":
-        return await on_claim(update, context)
-    if data == "home":
-        return await on_home(update, context)
-    if data == "balance":
-        return await on_balance(update, context)
-    if data == "refer":
-        return await on_refer(update, context)
-    if data == "daily_bonus":
-        return await on_daily(update, context)
-    if data == "withdraw":
-        return await on_withdraw(update, context)
-    if data.startswith("wd_"):
-        return await wd_choose(update, context)
-    if data == "proof":
-        return await on_proof(update, context)
-    if data.startswith(("appr_", "rej_", "ad_")):
-        return await admin_cb(update, context)
-
-
-def build_app() -> Application:
+# =============== HANDLERS ===============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_db()
+    user = update.effective_user
+    u = get_user(user.id)
 
+    # signup bonus (one-time)
+    if not u["joined_bonus_done"]:
+        u["coins"] += SIGNUP_BONUS
+        u["joined_bonus_done"] = True
+        save_db()
+
+    text = (
+        f"😍 Hey !! <b>{user.first_name}</b> Welcome To Bot\n"
+        f"🟢 Must Join All Channels To Use Bot\n"
+        f"⬛ After Joining click <b>Claim</b>"
+    )
+    await update.message.reply_html(text, reply_markup=join_force_kb())
+
+async def claim_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    if await is_joined_everywhere(context, user.id):
+        await query.edit_message_text(
+            f"✅ Welcome <b>{user.first_name}</b>\nChoose an option:",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await query.answer("Sab channels join karo pehle 🙂", show_alert=True)
+
+async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    u = get_user(user.id)
+    text = (
+        f"Hello 👋 <b>{user.first_name}</b>\n\n"
+        f"APKA ABHI BALANCE H🤑 <b>{u['coins']}</b>\n\n"
+        f"MINIMUM WITHDRAWAL 2000 COIN KA H"
+    )
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_kb())
+
+async def show_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    link = f"https://t.me/{(await context.bot.get_me()).username}?start={user.id}"
+    text = (
+        f"Hello 👋 <b>{user.first_name}</b>\n"
+        f"Apka Referral Link 👇\n{link}\n\n"
+        f"Per refer = <b>{REFER_BONUS}</b> coin 🪙\n\n"
+        f"🔴 Not Fake Refer Allowed"
+    )
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_kb())
+
+async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    u = get_user(user.id)
+
+    ok = False
+    today = datetime.utcnow().date()
+    last = u["last_bonus_date"]
+    if not last or datetime.fromisoformat(last).date() <= today - timedelta(days=1):
+        u["coins"] += DAILY_BONUS
+        u["last_bonus_date"] = datetime.utcnow().isoformat()
+        save_db()
+        ok = True
+
+    msg = (f"Hello 👋 <b>{user.first_name}</b>\n"
+           f"Daily bonus har 24 hours me add hota hai.\n"
+           f"Aaj ka bonus: <b>+{DAILY_BONUS}</b> coins ✅") if ok else \
+          ("⏳ Aapne aaj ka bonus le liya. Kal fir try karein 🙂")
+
+    await query.edit_message_text(msg, parse_mode="HTML", reply_markup=main_menu_kb())
+
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    u = get_user(user.id)
+    text = (
+        f"Hello 👋 <b>{user.first_name}</b>\n"
+        f"Aapka balance: <b>{u['coins']}</b>\n\n"
+        f"Withdrawal 1–2 hours me aapke <b>email</b> par aa jayega.\n"
+        f"Amount choose karein:"
+    )
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=withdraw_kb())
+
+async def choose_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    u = get_user(user.id)
+
+    coins = int(query.data.split("_")[1])
+    if u["coins"] < coins:
+        await query.answer("Itne coins nahi hain 😅", show_alert=True)
+        return
+
+    u["coins"] -= coins
+    save_db()
+
+    await query.edit_message_text(
+        f"✅ Request placed for <b>{coins}</b> coins.\n"
+        f"Payment 1–2 hours me email par aa jayega.",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb()
+    )
+
+async def proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Proofs yahan milenge:",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📂 Open Proof Channel", url=PROOF_CHANNEL_URL)],
+             [InlineKeyboardButton("◀️ Back", callback_data="back_menu")]]
+        )
+    )
+
+async def back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Choose an option:",
+        reply_markup=main_menu_kb()
+    )
+
+
+# =============== ADMIN (NO CONVERSATION) ===============
+def is_admin(uid: int) -> bool:
+    return uid in ADMINS
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(
+        "Admin:\n"
+        "/add <user_id> <coins>\n"
+        "/deduct <user_id> <coins>\n"
+        "/broadcast <text>"
+    )
+
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        uid = int(context.args[0])
+        amount = int(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /add <user_id> <coins>")
+        return
+    u = get_user(uid)
+    u["coins"] += amount
+    save_db()
+    await update.message.reply_text(f"✅ Added {amount} coins to {uid} (total {u['coins']})")
+
+async def deduct_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        uid = int(context.args[0])
+        amount = int(context.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: /deduct <user_id> <coins>")
+        return
+    u = get_user(uid)
+    u["coins"] = max(0, u["coins"] - amount)
+    save_db()
+    await update.message.reply_text(f"✅ Deducted {amount} coins from {uid} (total {u['coins']})")
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <text>")
+        return
+    text = " ".join(context.args)
+    ok = 0
+    for uid in list(db["users"].keys()):
+        try:
+            await context.bot.send_message(int(uid), text)
+            ok += 1
+        except Exception:
+            pass
+    await update.message.reply_text(f"📣 Sent to {ok} users.")
+
+
+# =============== ENTRY POINT ===============
+def main():
+    load_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping",  ping))
-    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("deduct", deduct_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
 
     # Buttons
-    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(CallbackQueryHandler(claim_join, pattern="^claim_join$"))
+    app.add_handler(CallbackQueryHandler(show_balance, pattern="^balance$"))
+    app.add_handler(CallbackQueryHandler(show_refer, pattern="^refer$"))
+    app.add_handler(CallbackQueryHandler(daily_bonus, pattern="^daily_bonus$"))
+    app.add_handler(CallbackQueryHandler(withdraw, pattern="^withdraw$"))
+    app.add_handler(CallbackQueryHandler(choose_withdraw, pattern="^wd_"))
+    app.add_handler(CallbackQueryHandler(proof, pattern="^proof$"))
+    app.add_handler(CallbackQueryHandler(back_menu, pattern="^back_menu$"))
 
-    # Withdraw conversation (asks email)
-    wd_conv = ConversationHandler(
-        entry_points=[],
-        states={ASK_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, wd_email)]},
-        fallbacks=[CommandHandler("start", start)],
-        per_chat=True, per_user=True, per_message=False,
-        name="wd_conv",
-    )
-    app.add_handler(wd_conv)
-
-    # Admin conversations
-    admin_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_cb, pattern="^ad_(add|deduct|cast|wds)$")],
-        states={
-            ADMIN_ADD:    [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add)],
-            ADMIN_DEDUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_deduct)],
-            ADMIN_BCAST:  [MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, admin_broadcast)],
-        },
-        fallbacks=[CommandHandler("admin", admin_panel)],
-        per_chat=True, per_user=True, per_message=False,
-        name="admin_conv",
-    )
-    app.add_handler(admin_conv)
-
-    return app
-
-
-def main():
-    app = build_app()
-    print("✅ Bot started…")
-    app.run_polling()
-
+    print("🤖 Bot started…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
